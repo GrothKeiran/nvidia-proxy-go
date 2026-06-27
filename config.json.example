@@ -1,8 +1,1 @@
-{
-  "keys": [
-    "nvapi-your-key-1",
-    "nvapi-your-key-2"
-  ],
-  "default_model": "z-ai/glm-5.1"
-}
-
+{"auth_key":"请改成一个长且随机的字符串作为客户端访问本代理时所需的 API Key","default_model":"z-ai/glm-5.1","keys":["nvapi-your-key-1","nvapi-your-key-2"]}

@@ -19,16 +19,17 @@ import (
 // ==================== 配置 ====================
 
 const (
-	nvidiaBase     = "https://integrate.api.nvidia.com/v1"
-	maxPerMinute   = 50    // 拉满，每 key 50次/分钟
-	globalRate     = 5.0   // 5 keys × 50/min = 250/min ≈ 4/sec
-	listenAddr     = ":9099"
-	rateLimitBurst = 20    // 允许较大突发
+	nvidiaBase = "https://integrate.api.nvidia.com/v1"
+	maxPerMinute = 50 // 拉满，每 key 50次/分钟
+	globalRate = 5.0 // 5 keys × 50/min = 250/min ≈ 4/sec
+	listenAddr = "0.0.0.0:9099"
+	rateLimitBurst = 20 // 允许较大突发
 )
 
 type Config struct {
-	Keys         []string `json:"keys"`
-	DefaultModel string   `json:"default_model,omitempty"`
+	Keys []string `json:"keys"`
+	DefaultModel string `json:"default_model,omitempty"`
+	AuthKey string `json:"auth_key,omitempty"`
 }
 
 // ==================== 令牌桶速率限制器 ====================
@@ -221,6 +222,55 @@ var rateLimiter *RateLimiter
 var globalReqCount atomic.Uint64
 var startTime time.Time
 var defaultModel string
+var authKey string
+
+// ==================== 鉴权 ====================
+
+// extractBearer 从 Authorization 头中提取 Bearer token
+func extractBearer(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		return ""
+	}
+	const prefix = "Bearer "
+	if strings.HasPrefix(auth, prefix) {
+		return strings.TrimSpace(auth[len(prefix):])
+	}
+	return strings.TrimSpace(auth)
+}
+
+// requireAuth 校验请求中的 API Key，失败则写入 401 并返回 false
+func requireAuth(w http.ResponseWriter, r *http.Request) bool {
+	if authKey == "" {
+		// 未配置鉴权 key 时，拒绝所有访问（避免公网裸奔）
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"type":    "auth_not_configured",
+				"message": "服务端未配置 auth_key，拒绝访问。请在 config.json 中设置 auth_key。",
+			},
+		})
+		return false
+	}
+	provided := extractBearer(r)
+	if provided == "" {
+		// 兼容部分客户端通过 x-api-key 头传递
+		provided = strings.TrimSpace(r.Header.Get("x-api-key"))
+	}
+	if provided == "" || provided != authKey {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"type":    "invalid_api_key",
+				"message": "无效的 API Key。请在 Authorization: Bearer <key> 或 x-api-key 头中提供正确的 auth_key。",
+			},
+		})
+		return false
+	}
+	return true
+}
 
 func init() {
 	sharedClient = &http.Client{
@@ -1224,16 +1274,25 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if path == "/v1/responses" || path == "/responses" {
+		if !requireAuth(w, r) {
+			return
+		}
 		responsesHandler(w, r)
 		return
 	}
 
 	if strings.Contains(path, "chat/completions") {
+		if !requireAuth(w, r) {
+			return
+		}
 		chatHandler(w, r)
 		return
 	}
 
 	if path == "/v1/models" || path == "/models" {
+		if !requireAuth(w, r) {
+			return
+		}
 		modelsHandler(w, r)
 		return
 	}
@@ -1269,16 +1328,23 @@ func main() {
 	if defaultModel == "" {
 		defaultModel = "z-ai/glm-5.1"
 	}
+	authKey = strings.TrimSpace(cfg.AuthKey)
+	if authKey == "" {
+		log.Printf("⚠️  未配置 auth_key，所有 API 端点将拒绝访问！请在 config.json 中设置 auth_key。")
+	} else {
+		log.Printf("🔒 已启用鉴权，客户端需在 Authorization: Bearer <auth_key> 中传入正确的 key")
+	}
 
-	log.Printf("🔑 已加载 %d 个 API key", len(cfg.Keys))
+	log.Printf("🔑 已加载 %d 个 NVIDIA API key", len(cfg.Keys))
 	log.Printf("🎯 每 key 限 %d 次/分钟", maxPerMinute)
 	log.Printf("🚦 全局速率限制: %.1f 次/秒 (%d 次/分钟)", globalRate, int(globalRate*60))
 	fmt.Println()
-	fmt.Printf("🚀 代理已启动: http://localhost%s\n", listenAddr)
+	fmt.Printf("🚀 代理已启动: http://%s (监听全部网卡，可公网访问)\n", listenAddr)
 	fmt.Printf("📡 转发目标: %s\n\n", nvidiaBase)
-	fmt.Printf("  Responses API (Codex CLI): POST http://localhost%s/v1/responses\n", listenAddr)
-	fmt.Printf("  Chat 备用:               POST http://localhost%s/v1/chat/completions\n", listenAddr)
-	fmt.Printf("  Models:                   GET  http://localhost%s/v1/models\n", listenAddr)
+	fmt.Printf(" Responses API (Codex CLI): POST http://<your-host>:9099/v1/responses\n")
+	fmt.Printf(" Chat 备用: POST http://<your-host>:9099/v1/chat/completions\n")
+	fmt.Printf(" Models: GET http://<your-host>:9099/v1/models\n")
+	fmt.Printf(" Health: GET http://<your-host>:9099/health\n")
 	fmt.Println()
 
 	http.HandleFunc("/", proxyHandler)
