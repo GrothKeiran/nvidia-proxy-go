@@ -20,10 +20,10 @@ import (
 
 const (
 	nvidiaBase     = "https://integrate.api.nvidia.com/v1"
-	maxPerMinute   = 38
-	globalRate     = 1.0
+	maxPerMinute   = 30    // 保守值，避免 429
+	globalRate     = 2.0   // 5 keys × 30/min = 150/min ≈ 2.5/sec
 	listenAddr     = ":9099"
-	rateLimitBurst = 5
+	rateLimitBurst = 5     // 小突发
 )
 
 type Config struct {
@@ -408,6 +408,9 @@ type streamWriter struct {
 	itemID   string
 	fullText string
 	hasText  bool
+	hasReasoning    bool
+	reasoningItemID string
+	reasoningText   string
 	toolCalls map[int]*toolCallAcc
 	seq      int
 	inputTokens int
@@ -457,6 +460,19 @@ func (s *streamWriter) emitTextDelta(content string) {
 	s.emit("response.output_text.delta", fmt.Sprintf(`{"type":"response.output_text.delta","delta":%s,"item_id":"%s","output_index":0,"content_index":0,"sequence_number":%d}`, quoteString(content), s.itemID, s.seq))
 }
 
+func (s *streamWriter) emitReasoningDelta(content string) {
+	if !s.hasReasoning {
+		s.hasReasoning = true
+		reasoningItemID := fmt.Sprintf("item_%x", time.Now().UnixNano())
+		s.reasoningItemID = reasoningItemID
+		s.emit("response.output_item.added", fmt.Sprintf(`{"type":"response.output_item.added","output_index":0,"item":{"id":"%s","type":"reasoning","status":"in_progress","summary":[],"content":[]}}`, reasoningItemID))
+	}
+
+	s.seq++
+	s.reasoningText += content
+	s.emit("response.reasoning_text.delta", fmt.Sprintf(`{"type":"response.reasoning_text.delta","delta":%s,"item_id":"%s","content_index":0,"sequence_number":%d}`, quoteString(content), s.reasoningItemID, s.seq))
+}
+
 func (s *streamWriter) emitToolCallDelta(idx int, name, arguments, callID string) {
 	if _, ok := s.toolCalls[idx]; !ok {
 		itemID := fmt.Sprintf("item_%x", time.Now().UnixNano())
@@ -486,6 +502,18 @@ func (s *streamWriter) emitToolCallDelta(idx int, name, arguments, callID string
 
 func (s *streamWriter) emitCompleted() {
 	outputItems := []map[string]interface{}{}
+
+	// Reasoning completion
+	if s.hasReasoning {
+		reasoningItem := map[string]interface{}{
+			"id": s.reasoningItemID, "type": "reasoning", "status": "completed",
+			"summary": []map[string]interface{}{},
+			"content": []map[string]interface{}{{"type": "reasoning_text", "text": s.reasoningText}},
+		}
+		itemJSON, _ := json.Marshal(reasoningItem)
+		s.emit("response.output_item.done", fmt.Sprintf(`{"type":"response.output_item.done","output_index":0,"item":%s}`, string(itemJSON)))
+		outputItems = append(outputItems, reasoningItem)
+	}
 
 	// Text completion
 	if s.hasText {
@@ -585,7 +613,7 @@ func cleanNulls(m map[string]interface{}) map[string]interface{} {
 
 // ==================== 调用 NVIDIA ====================
 
-func callNVIDIAStreaming(ctx context.Context, key, model string, messages []map[string]interface{}, tools []map[string]interface{}, w io.Writer, flusher http.Flusher) {
+func callNVIDIAStreaming(ctx context.Context, key, model string, messages []map[string]interface{}, tools []map[string]interface{}, extraParams map[string]interface{}, w io.Writer, flusher http.Flusher) {
 	chatReq := map[string]interface{}{
 		"model":    model,
 		"messages": messages,
@@ -593,6 +621,13 @@ func callNVIDIAStreaming(ctx context.Context, key, model string, messages []map[
 	}
 	if len(tools) > 0 {
 		chatReq["tools"] = tools
+	}
+	// Forward extra parameters, but strip unsupported ones
+	unsupportedParams := map[string]bool{"thinking": true, "reasoning_effort": true}
+	for k, v := range extraParams {
+		if _, exists := chatReq[k]; !exists && !unsupportedParams[k] {
+			chatReq[k] = v
+		}
 	}
 
 	reqBody, _ := json.Marshal(cleanNulls(chatReq))
@@ -603,7 +638,7 @@ func callNVIDIAStreaming(ctx context.Context, key, model string, messages []map[
 
 	var resp *http.Response
 	var err error
-	// Retry on 503 (server busy) up to 3 times
+	// Retry on 503/429 (server busy/rate limited) or 400 (unsupported params) up to 3 times
 	for retry := 0; retry < 3; retry++ {
 		req.Body = io.NopCloser(bytes.NewReader(reqBody))
 		resp, err = sharedClient.Do(req)
@@ -613,13 +648,35 @@ func callNVIDIAStreaming(ctx context.Context, key, model string, messages []map[
 			errWriter.emitFailed(model, fmt.Sprintf("request failed: %v", err))
 			return
 		}
-		if resp.StatusCode != 503 {
-			break
+		if resp.StatusCode == 503 || resp.StatusCode == 429 {
+			resp.Body.Close()
+			wait := time.Duration(5+retry*5) * time.Second
+			log.Printf("⏳ NVIDIA %d, retry %d/3 in %v...", resp.StatusCode, retry+1, wait)
+			time.Sleep(wait)
+			continue
 		}
-		resp.Body.Close()
-		wait := time.Duration(2+retry*2) * time.Second
-		log.Printf("⏳ NVIDIA 503 busy, retry %d/3 in %v...", retry+1, wait)
-		time.Sleep(wait)
+		// On 400, strip unsupported parameters and retry
+		if resp.StatusCode == 400 && retry < 2 {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if strings.Contains(string(body), "Unsupported parameter") {
+				log.Printf("⚠️ NVIDIA 400: stripping unsupported params, retry %d/3...", retry+1)
+				// Remove thinking and other potentially unsupported params
+				delete(chatReq, "thinking")
+				delete(chatReq, "reasoning_effort")
+				reqBody, _ = json.Marshal(cleanNulls(chatReq))
+				req, _ = http.NewRequestWithContext(ctx, "POST", nvidiaBase+"/chat/completions", bytes.NewReader(reqBody))
+				req.Header.Set("Authorization", "Bearer "+key)
+				req.Header.Set("Content-Type", "application/json")
+				continue
+			}
+			// Real 400 error, not unsupported params
+			log.Printf("❌ NVIDIA returned 400: %s", string(body[:min(200, len(body))]))
+			errWriter := newStreamWriter(w, flusher, model)
+			errWriter.emitFailed(model, fmt.Sprintf("NVIDIA returned 400: %s", string(body[:min(200, len(body))])))
+			return
+		}
+		break
 	}
 	defer resp.Body.Close()
 
@@ -651,8 +708,9 @@ func callNVIDIAStreaming(ctx context.Context, key, model string, messages []map[
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content   *string `json:"content"`
-					ToolCalls []struct {
+					Content          *string `json:"content"`
+					ReasoningContent *string `json:"reasoning_content"`
+					ToolCalls        []struct {
 						Index    *int    `json:"index"`
 						ID       *string `json:"id"`
 						Type     *string `json:"type"`
@@ -685,6 +743,11 @@ func callNVIDIAStreaming(ctx context.Context, key, model string, messages []map[
 		}
 
 		delta := chunk.Choices[0].Delta
+
+		// Handle reasoning_content (model thinking)
+		if delta.ReasoningContent != nil && *delta.ReasoningContent != "" {
+			writer.emitReasoningDelta(*delta.ReasoningContent)
+		}
 
 		if delta.Content != nil && *delta.Content != "" {
 			writer.emitTextDelta(*delta.Content)
@@ -719,7 +782,7 @@ func callNVIDIAStreaming(ctx context.Context, key, model string, messages []map[
 	}
 }
 
-func callNVIDIA(ctx context.Context, key, model string, messages []map[string]interface{}, tools []map[string]interface{}) ([]byte, error) {
+func callNVIDIA(ctx context.Context, key, model string, messages []map[string]interface{}, tools []map[string]interface{}, extraParams map[string]interface{}) ([]byte, error) {
 	chatReq := map[string]interface{}{
 		"model":    model,
 		"messages": messages,
@@ -727,6 +790,13 @@ func callNVIDIA(ctx context.Context, key, model string, messages []map[string]in
 	}
 	if len(tools) > 0 {
 		chatReq["tools"] = tools
+	}
+	// Forward extra parameters, but strip unsupported ones
+	unsupportedParams := map[string]bool{"thinking": true, "reasoning_effort": true}
+	for k, v := range extraParams {
+		if _, exists := chatReq[k]; !exists && !unsupportedParams[k] {
+			chatReq[k] = v
+		}
 	}
 
 	reqBody, _ := json.Marshal(cleanNulls(chatReq))
@@ -742,13 +812,30 @@ func callNVIDIA(ctx context.Context, key, model string, messages []map[string]in
 		if err != nil {
 			return nil, err
 		}
-		if resp.StatusCode != 503 {
-			break
+		if resp.StatusCode == 503 || resp.StatusCode == 429 {
+			resp.Body.Close()
+			wait := time.Duration(5+retry*5) * time.Second
+			log.Printf("⏳ NVIDIA %d, retry %d/3 in %v...", resp.StatusCode, retry+1, wait)
+			time.Sleep(wait)
+			continue
 		}
-		resp.Body.Close()
-		wait := time.Duration(2+retry*2) * time.Second
-		log.Printf("⏳ NVIDIA 503 busy, retry %d/3 in %v...", retry+1, wait)
-		time.Sleep(wait)
+		// On 400, strip unsupported parameters and retry
+		if resp.StatusCode == 400 && retry < 2 {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if strings.Contains(string(bodyBytes), "Unsupported parameter") {
+				log.Printf("⚠️ NVIDIA 400: stripping unsupported params, retry %d/3...", retry+1)
+				delete(chatReq, "thinking")
+				delete(chatReq, "reasoning_effort")
+				reqBody, _ = json.Marshal(cleanNulls(chatReq))
+				req, _ = http.NewRequestWithContext(ctx, "POST", nvidiaBase+"/chat/completions", bytes.NewReader(reqBody))
+				req.Header.Set("Authorization", "Bearer "+key)
+				req.Header.Set("Content-Type", "application/json")
+				continue
+			}
+			return nil, fmt.Errorf("NVIDIA returned 400: %s", string(bodyBytes[:min(200, len(bodyBytes))]))
+		}
+		break
 	}
 	defer resp.Body.Close()
 
@@ -856,6 +943,16 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		model = defaultModel
 	}
 
+	// Extract extra parameters to forward (thinking, etc.)
+	extraParams := map[string]interface{}{}
+	var rawReq map[string]interface{}
+	json.Unmarshal(body, &rawReq)
+	for _, key := range []string{"thinking", "reasoning_effort", "max_tokens", "top_p", "temperature", "frequency_penalty", "presence_penalty"} {
+		if v, ok := rawReq[key]; ok {
+			extraParams[key] = v
+		}
+	}
+
 	// 速率限制
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
@@ -888,7 +985,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !streaming {
 		// 非流式
-		respBody, err := callNVIDIA(ctx, usedKey, model, messages, tools)
+		respBody, err := callNVIDIA(ctx, usedKey, model, messages, tools, extraParams)
 		if err != nil {
 			log.Printf("%s [%d] #%d error: %v", emoji, 0, count, err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -910,7 +1007,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	flusher, _ := w.(http.Flusher)
 	log.Printf("%s [%d] #%d (Responses) %s model=%s key=...%s", emoji, 200, count, r.URL.Path, model, usedKey[len(usedKey)-6:])
 
-	callNVIDIAStreaming(ctx, usedKey, model, messages, tools, w, flusher)
+	callNVIDIAStreaming(ctx, usedKey, model, messages, tools, extraParams, w, flusher)
 }
 
 func chatHandler(w http.ResponseWriter, r *http.Request) {
@@ -921,10 +1018,11 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body.Close()
 
-	path := r.URL.Path
-	if len(path) >= 3 && path[:3] == "/v1" {
-		path = path[3:]
+	// 检测是否流式
+	var reqCheck struct {
+		Stream bool `json:"stream"`
 	}
+	json.Unmarshal(body, &reqCheck)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
@@ -934,31 +1032,87 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	usedKey := pool.Acquire()
-	req, _ := http.NewRequestWithContext(ctx, "POST", nvidiaBase+path, bytes.NewReader(body))
+	count := globalReqCount.Add(1)
+
+	req, _ := http.NewRequestWithContext(ctx, "POST", nvidiaBase+"/chat/completions", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+usedKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := sharedClient.Do(req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+	var resp *http.Response
+	// 重试逻辑（503 + 429）
+	for retry := 0; retry < 3; retry++ {
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		resp, err = sharedClient.Do(req)
+		if err != nil {
+			log.Printf("❌ [%d] NVIDIA error: %v", count, err)
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if resp.StatusCode == 503 || resp.StatusCode == 429 {
+			resp.Body.Close()
+			wait := time.Duration(5+retry*5) * time.Second
+			log.Printf("⏳ [%d] NVIDIA %d, retry %d/3 in %v...", count, resp.StatusCode, retry+1, wait)
+			// 换一个 key 重试
+			usedKey = pool.Acquire()
+			req, _ = http.NewRequestWithContext(ctx, "POST", nvidiaBase+"/chat/completions", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+usedKey)
+			req.Header.Set("Content-Type", "application/json")
+			time.Sleep(wait)
+			continue
+		}
+		break
 	}
 	defer resp.Body.Close()
 
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
+	// 非流式：直接返回
+	if !reqCheck.Stream {
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		emoji := "✅"
+		if resp.StatusCode != 200 {
+			emoji = "⚠️"
+		}
+		log.Printf("%s [%d] #%d (Chat) key=...%s", emoji, resp.StatusCode, count, usedKey[len(usedKey)-6:])
+		return
+	}
+
+	// 流式：转发 SSE
+	if resp.StatusCode != 200 {
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		log.Printf("⚠️ [%d] #%d (Chat-Stream) error", resp.StatusCode, count)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+
+	// 转发 SSE 数据
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		fmt.Fprintf(w, "%s\n", line)
+		if strings.HasPrefix(line, "data: ") && flusher != nil {
+			flusher.Flush()
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
 
-	count := globalReqCount.Add(1)
-	emoji := "✅"
-	if resp.StatusCode != 200 {
-		emoji = "⚠️"
-	}
-	log.Printf("%s [%d] #%d (Chat) %s key=...%s", emoji, resp.StatusCode, count, r.URL.Path, usedKey[len(usedKey)-6:])
+	log.Printf("✅ [%d] #%d (Chat-Stream) key=...%s", resp.StatusCode, count, usedKey[len(usedKey)-6:])
 }
 
 func modelsHandler(w http.ResponseWriter, r *http.Request) {
