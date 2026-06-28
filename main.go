@@ -4,15 +4,18 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -113,8 +116,22 @@ func NewKeyPool(keys []string) *KeyPool {
 	return &KeyPool{slots: slots}
 }
 
+// Acquire 保留无参版本以兼容现有调用点，内部委托给 AcquireCtx。
+// 注意：无参版本不会响应 ctx 取消，调用方应在能拿到 ctx 的地方直接用 AcquireCtx。
 func (p *KeyPool) Acquire() string {
+	k, _ := p.AcquireCtx(context.Background())
+	return k
+}
+
+// AcquireCtx 在所有 key 达到上限时会等待，但会在 ctx 取消时立即返回 (", false)。
+// 这样调用方可以在客户端断开或请求超时时及时退出，避免 goroutine 泄漏。
+func (p *KeyPool) AcquireCtx(ctx context.Context) (string, bool) {
 	for {
+		// 快速检查 ctx 是否已取消
+		if err := ctx.Err(); err != nil {
+			return "", false
+		}
+
 		p.mu.Lock()
 		now := time.Now()
 
@@ -158,7 +175,7 @@ func (p *KeyPool) Acquire() string {
 			p.idx = (bestIdx + 1) % len(p.slots)
 			k := slot.key
 			p.mu.Unlock()
-			return k
+			return k, true
 		}
 
 		// 所有 key 都满了，找最早重置的
@@ -172,7 +189,14 @@ func (p *KeyPool) Acquire() string {
 		p.mu.Unlock()
 
 		log.Printf("[限流] 全部 key 达到上限，等待 %v...", wait.Round(time.Millisecond))
-		time.Sleep(wait)
+		// 用 select 替代 time.Sleep，支持 ctx 取消
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", false
+		case <-timer.C:
+		}
 	}
 }
 
@@ -258,7 +282,7 @@ func requireAuth(w http.ResponseWriter, r *http.Request) bool {
 		// 兼容部分客户端通过 x-api-key 头传递
 		provided = strings.TrimSpace(r.Header.Get("x-api-key"))
 	}
-	if provided == "" || provided != authKey {
+	if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(authKey)) != 1 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1016,9 +1040,10 @@ func callNVIDIA(ctx context.Context, key, model string, messages []map[string]in
 // ==================== HTTP 处理 ====================
 
 func responsesHandler(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "读取请求体失败", http.StatusBadRequest)
+		http.Error(w, "读取请求体失败: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	r.Body.Close()
@@ -1098,13 +1123,91 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	callNVIDIAStreaming(ctx, usedKey, model, messages, tools, extraParams, w, flusher)
 }
 
+// sanitizeChatBody 规范化 Chat Completions 请求体，避免 NVIDIA 400：
+//   - 删除 NVIDIA 不支持的 thinking 字段
+//   - 规范化 reasoning_effort：NVIDIA 仅接受 none/minimal/low/medium/high/xhigh，
+//     OpenAI 风格的 "max" 映射为 "xhigh"，其他未知值映射为 "high"
+// 解析失败时原样返回，让 NVIDIA 自己报错。
+func sanitizeChatBody(body []byte) []byte {
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+	changed := false
+
+	// 剥离 thinking（NVIDIA 不支持）
+	if _, ok := req["thinking"]; ok {
+		delete(req, "thinking")
+		changed = true
+	}
+
+	// 规范化 reasoning_effort
+	if re, ok := req["reasoning_effort"]; ok {
+		if s, ok := re.(string); ok && s != "" {
+			valid := map[string]bool{
+				"none": true, "minimal": true, "low": true,
+				"medium": true, "high": true, "xhigh": true,
+			}
+			if !valid[s] {
+				if s == "max" {
+					req["reasoning_effort"] = "xhigh"
+				} else {
+					req["reasoning_effort"] = "high"
+				}
+				changed = true
+			}
+		}
+	}
+
+	if !changed {
+		return body
+	}
+	newBody, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	log.Printf("[sanitize] 已规范化请求体：剥离 thinking / 规范化 reasoning_effort")
+	return newBody
+}
+
+// stripUnsupportedParams 删除 NVIDIA 不支持的参数（thinking / reasoning_effort）。
+// 用于 400 "Unsupported parameter" / "unknown variant" 错误后的重试。
+// 返回 nil 表示无需改动或解析失败（调用方应停止重试）。
+func stripUnsupportedParams(body []byte) []byte {
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil
+	}
+	changed := false
+	if _, ok := req["thinking"]; ok {
+		delete(req, "thinking")
+		changed = true
+	}
+	if _, ok := req["reasoning_effort"]; ok {
+		delete(req, "reasoning_effort")
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	newBody, err := json.Marshal(req)
+	if err != nil {
+		return nil
+	}
+	return newBody
+}
+
 func chatHandler(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "读取请求体失败", http.StatusBadRequest)
+		http.Error(w, "读取请求体失败: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	r.Body.Close()
+
+	// 规范化参数（修复 reasoning_effort=max 等导致的 400）
+	body = sanitizeChatBody(body)
 
 	// 检测是否流式
 	var reqCheck struct {
@@ -1115,35 +1218,86 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 
-	usedKey := pool.Acquire()
+	usedKey, ok := pool.AcquireCtx(ctx)
+	if !ok {
+		http.Error(w, "请求被取消或所有 key 不可用", http.StatusServiceUnavailable)
+		return
+	}
 	count := globalReqCount.Add(1)
 
-	req, _ := http.NewRequestWithContext(ctx, "POST", nvidiaBase+"/chat/completions", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+usedKey)
-	req.Header.Set("Content-Type", "application/json")
-
+	const maxRetries = 3
+	currentBody := body
 	var resp *http.Response
-	// 重试逻辑（503 + 429）
-	for retry := 0; retry < 3; retry++ {
-		req.Body = io.NopCloser(bytes.NewReader(body))
+
+	for retry := 0; retry < maxRetries; retry++ {
+		req, _ := http.NewRequestWithContext(ctx, "POST", nvidiaBase+"/chat/completions", bytes.NewReader(currentBody))
+		req.Header.Set("Authorization", "Bearer "+usedKey)
+		req.Header.Set("Content-Type", "application/json")
+
 		resp, err = sharedClient.Do(req)
 		if err != nil {
 			log.Printf("❌ [%d] NVIDIA error: %v", count, err)
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			if ctx.Err() != nil {
+				http.Error(w, "请求被取消", http.StatusBadGateway)
+			} else {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+			}
 			return
 		}
+
+		// 503/429：换 key + 退避重试，最后一次直接返回 502
 		if resp.StatusCode == 503 || resp.StatusCode == 429 {
 			resp.Body.Close()
 			pool.MarkFailed(usedKey)
+			if retry == maxRetries-1 {
+				log.Printf("⚠️ [%d] NVIDIA %d, 已达重试上限 %d", count, resp.StatusCode, maxRetries)
+				http.Error(w, fmt.Sprintf("NVIDIA %d after %d retries", resp.StatusCode, maxRetries), http.StatusBadGateway)
+				return
+			}
 			wait := time.Duration(5+retry*5) * time.Second
-			log.Printf("⏳ [%d] NVIDIA %d, retry %d/3 in %v...", count, resp.StatusCode, retry+1, wait)
-			// 换一个 key 重试
-			usedKey = pool.Acquire()
-			req, _ = http.NewRequestWithContext(ctx, "POST", nvidiaBase+"/chat/completions", bytes.NewReader(body))
-			req.Header.Set("Authorization", "Bearer "+usedKey)
-			req.Header.Set("Content-Type", "application/json")
-			time.Sleep(wait)
+			log.Printf("⏳ [%d] NVIDIA %d, retry %d/%d in %v...", count, resp.StatusCode, retry+1, maxRetries, wait)
+			// 用 select 等待，支持 ctx 取消（客户端断开时及时退出）
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				http.Error(w, "请求被取消", http.StatusBadGateway)
+				return
+			case <-timer.C:
+			}
+			// 换 key，带 ctx 取消感知
+			newKey, ok := pool.AcquireCtx(ctx)
+			if !ok {
+				http.Error(w, "请求被取消或所有 key 不可用", http.StatusServiceUnavailable)
+				return
+			}
+			usedKey = newKey
 			continue
+		}
+
+		// 400：检测 "Unsupported parameter" / "unknown variant"，剥离参数后重试一次
+		if resp.StatusCode == 400 && retry < maxRetries-1 {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			bodyStr := string(bodyBytes)
+			if strings.Contains(bodyStr, "Unsupported parameter") || strings.Contains(bodyStr, "unknown variant") {
+				log.Printf("⚠️ [%d] NVIDIA 400: 规范化参数后重试 %d/%d...", count, retry+1, maxRetries)
+				if stripped := stripUnsupportedParams(currentBody); stripped != nil {
+					currentBody = stripped
+					continue
+				}
+			}
+			// 真 400，透传给客户端
+			log.Printf("⚠️ [%d] NVIDIA 400: %s", count, bodyStr[:min(200, len(bodyStr))])
+			for k, vv := range resp.Header {
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write(bodyBytes)
+			return
 		}
 		break
 	}
@@ -1322,7 +1476,6 @@ func main() {
 	}
 
 	pool = NewKeyPool(cfg.Keys)
-	rateLimiter = NewRateLimiter(globalRate, rateLimitBurst)
 	startTime = time.Now()
 	defaultModel = cfg.DefaultModel
 	if defaultModel == "" {
@@ -1347,13 +1500,29 @@ func main() {
 	fmt.Printf(" Health: GET http://<your-host>:9099/health\n")
 	fmt.Println()
 
-	http.HandleFunc("/", proxyHandler)
-	log.Fatal(http.ListenAndServe(listenAddr, nil))
-}
+ http.HandleFunc("/", proxyHandler)
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+ srv := &http.Server{
+ Addr: listenAddr,
+ ReadHeaderTimeout: 10 * time.Second,
+ ReadTimeout: 0,
+ WriteTimeout: 0,
+ IdleTimeout: 120 * time.Second,
+ }
+ // 优雅关闭：收到 SIGINT/SIGTERM 后给进行中的请求最多 30s 完成
+ stop := make(chan os.Signal, 1)
+ signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+ go func() {
+ sig := <-stop
+ log.Printf("📡 收到信号 %v，开始优雅关闭（最长等待 30s）...", sig)
+ shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+ defer shutdownCancel()
+ if err := srv.Shutdown(shutdownCtx); err != nil {
+ log.Printf("⚠️ 优雅关闭失败: %v", err)
+ os.Exit(1)
+ }
+ log.Printf("✅ 优雅关闭完成")
+ os.Exit(0)
+ }()
+ log.Fatal(srv.ListenAndServe())
 }
